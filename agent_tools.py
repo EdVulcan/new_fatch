@@ -1,92 +1,187 @@
 """
 OpenClaw 3.0 Agent Tools
 提供给大语言模型 (LLM) 量化智能体使用的标准化工具库。纯净的 Python 函数形态，依托 Google Style Docstring 规范以便充分被大模型所理解和调用。
+
+工具清单：
+  1. get_current_market_semantics()    - 获取当前市场行情语义
+  2. verify_strategy_code()           - 沙盒回测验证 (必须先调用此工具)
+  3. execute_oanda_trade()            - 实盘下单 (仅限沙盒验证通过后)
+  4. broadcast_trade_report()         - 广播作战报告
+  5. get_performance_review()         - 读取历史盈亏，供自我反思与迭代
+  6. get_safe_position_size()         - 仓位风险管理与保证金预警 (必须在下单前调用)
 """
 
 from kline_translator import generate_mock_klines, KlineTranslator
 from strategy_sandbox import StrategySandbox
+from oanda_executor import (
+    execute_oanda_trade as _oanda_execute,
+    broadcast_trade_report as _broadcast,
+    get_account_summary,
+    get_recent_closed_trades
+)
+from risk_manager import calculate_position_size
 import logging
+from typing import Literal
 
 logger = logging.getLogger("AgentTools")
 
 def get_current_market_semantics() -> str:
     """
     获取当前市场行情的自然语言语义描述。
-
-    当需要分析当前市场走势、获取行情全局与微观状态、或者寻找新的交易灵感与形态特征时，必须首先调用此工具获取底层的自然语言数据支持。
-    该工具有效地将冰冷抽象的量化形态数据（OHLCV），转换为一份带有明确结论与业务层面解读的研判提示文本。
-
     Returns:
-        str: 行情分析战报。包含一段描述全局行情历史趋势（例如：震荡偏上整理）的文本；
-             以及最近几根 K 线十分详尽的明细特征解析（例如：放量大阳线，长下影线探底针护盘，缩量十字星等），
-             用于为 LLM 智能体提供精准的下一步操盘灵感。
+        str: 行情分析战报。
     """
-    # 获取 100 根虚拟 K 线的结构化行情数据
     df_history = generate_mock_klines(100)
-    
-    # 实例化数据翻译器总线
     translator = KlineTranslator()
-    
-    # 将标准DataFrame翻译成带有情绪指引和特征浓缩的提示词报告
-    # 即便只有最近5根的精细快照，也能够借助第一句总趋势掌握大局观
-    semantics_report = translator.translate_to_prompt(df_history, last_n=5)
-    
-    return semantics_report
+    return translator.translate_to_prompt(df_history, last_n=5)
 
 
 def verify_strategy_code(strategy_code_str: str) -> dict:
     """
     在极速的仿真回测沙盒中安全验证交易策略代码的有效性与胜率表现。
-
-    【🚨 严重警告】：严禁直接向主进程或交易路由器输出具有实盘操盘指令的代码段！
-    任何基于行情数据获取、分析以及启发灵感后撰写的量化代码逻辑，在提出部署实盘之前，
-    必须强制作为此沙盒验证 API 的参数进行全方位的回测与洗礼。
-
-    传入本函数的参数必须是一段包含了主入口判定函数 `evaluate_signal` 的完整纯正且无污染的 Python 脚本。
-    签名强制约定为： `def evaluate_signal(df_slice):` -> 根据滑动窗口数据片段返回 bool 值（True 代表在此刻开仓买入）。
-    
-    如果你写的代码导致异常报错、逻辑卡死或是无法通过裁判标准（胜率过低，盈亏比失衡），沙盒将会进行否决并指点你为何不通过；
-    如果你通过了考验，你方可整理上报一份通过报告给系统管理员（人类指战员）。
-
-    Args:
-        strategy_code_str (str): 必须是一段携带了 `def evaluate_signal(df_slice):` 函数原型的极简化 Python 逻辑代码字符串。
-
-    Returns:
-        dict: 裁判评估委员会的评测回执结果字典，包含以下字段用于判断生死：
-            - passed (bool): True 表示该策略击败了所有风控指标及格线，False 则被直接枪毙。
-            - win_rate (float): 采用极速平移回测法在最近的历史数据片段中跑出的胜率指标（小数形式）。
-            - trades (int): 该段逻辑一共触发了几笔交易。
-            - pnl_ratio (float): 该策略在有效周期内的平均盈亏比率值。
-            - reason (str): 通过（Perfect）或者被无情否决的具体理由说明（包含编译错误栈或者低劣胜率指标原因），可指引进一步迭代。
     """
-    # 实例化自带严苛裁判体系的回测闭环虚拟沙盒
-    # 配置: 最少成单不得小于3笔，胜率必须维持 45%+ 以及 1.0 的盈亏比基准线
     sandbox = StrategySandbox(min_trades=3, min_win_rate=0.45, min_pnl_ratio=1.0)
-    
-    # 使用新的一份独立100根环境数据做背靠背验证
     df_history = generate_mock_klines(100)
     
     try:
-        # 使用隔离环境编译这段由野生大模型天马行空撰写的外来危险战略脚本
-        # 严格限制作用域并试图抓取约定好的 `evaluate_signal` 对象
-        # 如果连名字都写错了，它将抛出错误并在回执中教训提交者
         strategy_func = sandbox.load_strategy(strategy_code_str, func_name="evaluate_signal")
-        
-        # 将代码与环境历史数据交配滑动遍历（在此演示中：参考以往3根K线去决策，并严格锁仓持有2根K线后释放）
         test_results = sandbox.run_backtest(df_history, strategy_func, window_size=3, hold_bars=2)
-        
-        # 请裁判团下达处决书或准考证
         decision = sandbox.judge(test_results)
         return decision
-        
     except Exception as e:
-        # 如果代码逻辑跑挂了（语法错误、超出边界或是压根没有按照要求包装入参）
-        # 返回标准的错误信息给回 LLM 使其作为反思和下一次重写的经验（Reflection Loop）
         logger.error(f"⚠️ 工具箱在代执行过程中捕获异常: {e}")
         return {
             'passed': False,
             'win_rate': 0.0,
             'trades': 0,
             'pnl_ratio': 0.0,
-            'reason': f"代码注入沙盒执行时发生编译报错或运行时崩溃 (请仔细检查数据切片和索引边界): {str(e)}"
+            'reason': f"代码注入沙盒执行时发生编译报错或运行时崩溃: {str(e)}"
         }
+
+
+def execute_oanda_trade(
+    instrument: str,
+    units: int,
+    side: Literal["buy", "sell"],
+    sandbox_verdict: dict
+) -> dict:
+    """
+    在 OANDA 模拟账户下达市价单。此函数是实盘操盘的最终入口。
+
+    【🔒 强制安全门控】：此函数内嵌了沙盒验证通过检查，必须将 `verify_strategy_code` 的返回值
+    原封不动地作为 `sandbox_verdict` 参数传入本函数。若沙盒未通过（passed=False），本函数将拒绝
+    执行并立刻返回错误，防止 Agent 绕过验证直接上实盘。
+
+    【⚖️ 仓位管理约束】：严禁私自猜测或固定下单数量。在此之前，必须先调用 `get_safe_position_size` 
+    算出符合风险标准的 units，并按其结果进行交易。
+
+    【🚨 流动性警告】：如果 `get_safe_position_size` 返回的 `margin_ratio` 超过 20%，
+    系统将触发流动性预警。此时必须优先考虑账户存续，减小仓位或放弃交易。
+
+    Args:
+        instrument (str): 交易品种代码（如 'XAU_USD'）。
+        units (int): 开仓数量。
+        side (Literal["buy", "sell"]): 交易方向。
+        sandbox_verdict (dict): `verify_strategy_code()` 的返回值。
+
+    Returns:
+        dict: OANDA 委托执行响应。
+    """
+    if not sandbox_verdict.get("passed", False):
+        reason = sandbox_verdict.get("reason", "未通过沙盒验证")
+        logger.error(f"🚫 实盘请求被门控拦截！沙盒裁决为否决：{reason}")
+        return {
+            "success": False,
+            "order_id": None,
+            "instrument": instrument,
+            "units": 0,
+            "price": 0.0,
+            "timestamp": "",
+            "error": f"[GATE_BLOCKED] 策略未通过沙盒验证，拒绝上实盘。原因：{reason}"
+        }
+
+    logger.info(f"✅ 安全门控通过（胜率: {sandbox_verdict.get('win_rate', 0):.1%}），准予下单 {instrument} {side.upper()} {units}")
+    return _oanda_execute(instrument, units, side)
+
+
+def broadcast_trade_report(action_details: dict) -> str:
+    """
+    将一笔交易事件格式化为极具可读性的 Markdown 风格"作战报告"，实时广播给指挥官。
+    战报中包含财务风险看板，展示保证金占用、占比及强平风险垫。
+
+    Args:
+        action_details (dict): 包含 action, instrument, price, units 
+                             以及字段 margin_used, margin_ratio, safety_buffer_pct。
+    """
+    return _broadcast(action_details)
+
+
+def get_performance_review() -> dict:
+    """
+    读取 OANDA 模拟盘的历史盈亏记录，供 Agent 进行自我反思与策略迭代。
+    """
+    account = get_account_summary()
+    recent_trades = get_recent_closed_trades(count=20)
+    total_pnl = sum(t["realized_pnl"] for t in recent_trades)
+    wins = [t for t in recent_trades if t["realized_pnl"] > 0]
+    win_rate = len(wins) / len(recent_trades) if recent_trades else 0.0
+    best = max(recent_trades, key=lambda t: t["realized_pnl"], default=None)
+    worst = min(recent_trades, key=lambda t: t["realized_pnl"], default=None)
+
+    return {
+        "account": account,
+        "recent_trades": recent_trades,
+        "summary": {
+            "total_trades": len(recent_trades),
+            "total_pnl": round(total_pnl, 4),
+            "win_rate": round(win_rate, 4),
+            "best_trade": best,
+            "worst_trade": worst
+        }
+    }
+
+
+def get_safe_position_size(
+    risk_level: float, 
+    stop_loss_price: float, 
+    entry_price: float, 
+    instrument: str
+) -> dict:
+    """
+    计算并在实战中推荐安全的下单数量 (Units) 与相关财务风险指标。
+
+    【💡 核心流程】：在准备执行 `execute_oanda_trade` 下单之前，必须调用此工具。
+    它会自动查询你当前的 OANDA 账户净值，并结合你指定的风险百分比和止损间距，
+    算出符合 20 倍杠杆上限保护的安全头寸，并提供保证金预测。
+
+    Args:
+        risk_level (float): 愿意承担的风险比例 (如 0.01)。
+        stop_loss_price (float): 预设止损价位。
+        entry_price (float): 入场价。
+        instrument (str): 品种代码。
+
+    Returns:
+        dict: 风险评估报告字典，包含：
+            - final_units (int): 最终下注单位
+            - margin_used (float): 保证金占用金额 (USD)
+            - margin_ratio (float): 保证金占用比例 (0-1 之间)
+            - notional_value (float): 名义总价值 (USD)
+            - safety_buffer_pct (float): 止损空间百分比
+            - leverage_used (float): 实际杠杆倍数
+    """
+    acc_summary = get_account_summary()
+    equity = acc_summary.get("nav", 0)
+    
+    if equity <= 0:
+        logger.error("❌ 账户净值为 0 或负数，无法计算仓位。")
+        return {"final_units": 0, "margin_used": 0, "margin_ratio": 0}
+        
+    risk_metadata = calculate_position_size(
+        equity=equity,
+        risk_percent=risk_level,
+        stop_loss_price=stop_loss_price,
+        entry_price=entry_price,
+        instrument=instrument
+    )
+    
+    return risk_metadata
